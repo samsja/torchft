@@ -41,6 +41,16 @@ def extract_local_tensor(t: torch.Tensor) -> torch.Tensor:
     new_tensor.grad = None
     return new_tensor
 
+def extract_local_tensor_no_clone(t: torch.Tensor) -> torch.Tensor:
+    """
+    Returns a cloned version of the input tensor. If the input tensor is a DTensor,
+    it extracts its local representation.
+    """
+    if isinstance(t, DTensor):
+        return t.to_local()
+    else:
+        return t
+        
 
 class LocalSGD:
     """
@@ -164,7 +174,7 @@ class LocalSGD:
         averaged_parameters = []
         for p in self._model.parameters():
             # Create a new tensor to store the averaged parameter
-            avg_param = extract_local_tensor(p)
+            avg_param = extract_local_tensor_no_clone(p)
             works.append(self._manager.allreduce(avg_param))
             averaged_parameters.append(avg_param)
         for work in works:
@@ -752,7 +762,7 @@ class DiLoCo:
         # 1. Step 1 - Node A sends fragment 1
         # 2. Step 1 - Node B sends fragment 2
         # 3. Step 2 - Node A waits for fragment 1
-        # 4. Step 2 - Node B waits for fragment 2
+        # 4. Step 2 - Node B waits for fragment 2_allreduce_work
         #
         # Both of them will fail because Node A didn't send fragment 2
         # and Node B didn't send fragment 1.
@@ -812,116 +822,122 @@ class SimpleDiLoCo:
             outer_optimizer: Optimizer for outer updates
             sync_every: How often to sync
         """
+        super().__init__()
         self._manager = manager
         self._model = model
         self._inner_optimizer = inner_optimizer
         self._outer_optimizer = outer_optimizer
-        self._sync_every = sync_every
         self._local_step = 0
-        
-        # Storage for original parameters
-        self._original_params: Dict[str, torch.Tensor] = {}
-        
-        # Hooks
+        self._sync_every = sync_every
+        assert sync_every >= 1, "sync_every must be greater than or equal to 1"
+
         self._hooks: List[RemovableHandle] = []
         
-        # Save initial parameters
+        self._original_params =  dict()
         self._save_original_params()
-    
+        
     def _save_original_params(self) -> None:
-        """Save the original parameters."""
+        """Save the original (checkpoint) parameters."""
         with torch.no_grad():
             for name, param in self._model.named_parameters():
                 self._original_params[name] = extract_local_tensor(param)
-    
-    def _sync(self) -> None:
-        """Perform synchronization."""
-        self._manager.start_quorum()
         
-        # Compute pseudo-gradients
-        pseudo_grads = {}
-        with torch.no_grad():
-            for name, param in self._model.named_parameters():
-                if isinstance(param, DTensor):
-                    local_param = param.to_local()
-                else:
-                    local_param = param
-                
-                original = self._original_params[name].to(param.device)
-                pseudo_grads[name] = original - local_param
         
-        # All-reduce (blocking)
-        works = []
-        for name in pseudo_grads:
-            work = self._manager.allreduce(pseudo_grads[name])
-            works.append(work)
         
-        for work in works:
-            work.wait()
-        
-        if self._manager.should_commit():
-            # Restore to checkpoint
-            with torch.no_grad():
-                for name, param in self._model.named_parameters():
-                    original = self._original_params[name].to(param.device)
-                    if isinstance(param, DTensor):
-                        param.data.copy_(
-                            DTensor.from_local(
-                                original,
-                                param.device_mesh,
-                                param.placements,
-                                shape=param.shape,
-                                stride=param.stride(),
-                            )
-                        )
-                    else:
-                        param.data.copy_(original)
-            
-            # Apply outer optimizer
-            with torch.no_grad():
-                for name, param in self._model.named_parameters():
-                    grad = pseudo_grads[name]
-                    if isinstance(param, DTensor):
-                        param.grad = DTensor.from_local(
-                            grad,
-                            param.device_mesh,
-                            param.placements,
-                            shape=param.shape,
-                            stride=param.stride(),
-                        )
-                    else:
-                        param.grad = grad
-            
-            self._outer_optimizer.step()
-            self._outer_optimizer.zero_grad()
-            
-            # Save new checkpoint
-            self._save_original_params()
-    
-    def _step_post_hook(self, *args, **kwargs) -> None:
-        """Hook called after each optimizer step."""
-        self._local_step += 1
-        if self._local_step >= self._sync_every:
-            self._sync()
-            self._local_step = 0
-    
-    def __enter__(self) -> "SimpleDiLoCo":
-        """Context manager entry."""
+
+    def __enter__(self) -> "LocalSGD":
+        self._hooks.append(
+            self._inner_optimizer.register_step_pre_hook(self._step_pre_hook)
+        )
+        # Add optimizer hook which increments the local step counter and syncs if necessary
         self._hooks.append(
             self._inner_optimizer.register_step_post_hook(self._step_post_hook)
         )
         return self
-    
-    def __exit__(self, *args) -> bool:
-        """Context manager exit."""
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> bool:
+        # Handle any cleanup or error handling here
+        # Clean up hooks
         for hook in self._hooks:
             hook.remove()
         self._hooks.clear()
-        return False
 
+        return False  # Propagate exceptions
 
+    def _step_pre_hook(
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
+    ) -> None:
+        # The checkpoint may transfer model parameters, so we need to make access to it thread safe
+        self._manager.disallow_state_dict_read()
 
+    def _step_post_hook(
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
+    ) -> None:
+        """
+        This hook is registered on the optimizer and is called after the optimizer step.
+        """
+        self._manager.allow_state_dict_read()
 
+        self._local_step += 1
+        if self._local_step >= self._sync_every:
+            self.sync()
+
+    def sync(self) -> None:
+        """
+        Synchronizes and averages the model weights across the manager.
+        """
+        self._manager.start_quorum()
+        self._perform_sync()
+        self._local_step = 0
+
+    @torch.no_grad()
+    def _perform_sync(self) -> None:
+        """
+        Performs the synchronization of the model weights across the manager.
+        """
+        
+        
+        if self._manager.should_commit():
+            pseudo_grads = dict()
+                        
+            for name, param in self._model.named_parameters():
+                og_param = self._original_params[name]
+                pseudo_grads[name] = og_param - extract_local_tensor_no_clone(param)
+            
+            
+            works = []
+            avg_pseudo_grads = dict()
+            
+            for name, pseudo_grad in pseudo_grads.items():
+                avg_pseudo_grad = extract_local_tensor_no_clone(pseudo_grad)
+                works.append(self._manager.allreduce(avg_pseudo_grad))
+                avg_pseudo_grads[name] = avg_pseudo_grad
+
+            for work in works:
+                work.wait()
+                
+            
+            for name, param in self._model.named_parameters():
+                
+                local_data = extract_local_tensor_no_clone(param.data)
+                local_data.copy_(self._original_params[name])
+                
+                param.grad = torch.zeros_like(param.data)
+                
+                local_grad = extract_local_tensor_no_clone(param.grad)
+                local_grad.copy_(avg_pseudo_grads[name])
+                
+            self._outer_optimizer.step()
+            self._outer_optimizer.zero_grad()
+            
+            self._save_original_params()
+
+        
 class EagerDiLoCo:
     """
     Eager DiLoCo implementation with overlapped communication.
