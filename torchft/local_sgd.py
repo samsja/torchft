@@ -937,8 +937,7 @@ class SimpleDiLoCo:
             
             self._save_original_params()
 
-        
-class EagerDiLoCo:
+       class EagerDiLoCo:
     """
     Eager DiLoCo implementation with overlapped communication.
     
@@ -960,274 +959,139 @@ class EagerDiLoCo:
         inner_optimizer: optim.Optimizer,
         outer_optimizer: optim.Optimizer,
         sync_every: int,
-        use_eager: bool = True,
-        outer_lr_scale: float = 1.0,
     ) -> None:
         """
-        Initialize Eager DiLoCo.
+        Initialize standard DiLoCo.
         
         Args:
             manager: The manager for distributed coordination
             model: The model to train
-            inner_optimizer: Optimizer for inner updates (e.g., AdamW)
-            outer_optimizer: Optimizer for outer updates (e.g., SGD with momentum)
-            sync_every: How often to sync (number of inner steps)
-            use_eager: Whether to use eager updates (vs standard delayed)
-            outer_lr_scale: Scale factor for outer learning rate
+            inner_optimizer: Optimizer for inner updates
+            outer_optimizer: Optimizer for outer updates
+            sync_every: How often to sync
         """
+        super().__init__()
         self._manager = manager
         self._model = model
         self._inner_optimizer = inner_optimizer
         self._outer_optimizer = outer_optimizer
-        self._sync_every = sync_every
-        self._use_eager = use_eager
-        self._outer_lr_scale = outer_lr_scale
-        
-        # Step counter
         self._local_step = 0
-        
-        # Storage for original parameters (checkpoint)
-        self._original_params: Dict[str, torch.Tensor] = {}
-        
-        # Storage for pseudo-gradients
-        self._pseudo_grads: Dict[str, torch.Tensor] = {}
-        
-        # Storage for current local pseudo-gradients (for eager)
-        self._local_pseudo_grads: Dict[str, torch.Tensor] = {}
-        
-        # All-reduce work handles
-        self._allreduce_works: List[dist.Work] = []
-        
-        # Track if we have a pending all-reduce
-        self._has_pending_allreduce = False
-        
-        # Hooks
+        self._sync_every = sync_every
+        assert sync_every >= 1, "sync_every must be greater than or equal to 1"
+
         self._hooks: List[RemovableHandle] = []
         
-        # Save initial parameters
+        self._original_params =  dict()
         self._save_original_params()
-    
+        
+        self.prev_pseudo_grads = dict()
+        self.prev_work_handles = None
+        
     def _save_original_params(self) -> None:
         """Save the original (checkpoint) parameters."""
         with torch.no_grad():
             for name, param in self._model.named_parameters():
                 self._original_params[name] = extract_local_tensor(param)
-    
-    def _restore_original_params(self) -> None:
-        """Restore model to original (checkpoint) parameters."""
-        with torch.no_grad():
-            for name, param in self._model.named_parameters():
-                original = self._original_params[name].to(param.device)
-                if isinstance(param, DTensor):
-                    param.data.copy_(
-                        DTensor.from_local(
-                            original,
-                            param.device_mesh,
-                            param.placements,
-                            shape=param.shape,
-                            stride=param.stride(),
-                        )
-                    )
-                else:
-                    param.data.copy_(original)
-    
-    def _compute_pseudo_gradients(self) -> None:
-        """
-        Compute pseudo-gradients (parameter deltas).
-        Pseudo-gradient = θ_original - θ_current
-        """
-        with torch.no_grad():
-            for name, param in self._model.named_parameters():
-                if isinstance(param, DTensor):
-                    local_param = param.to_local()
-                else:
-                    local_param = param
-                
-                # Compute delta: Δ = θ_original - θ_current
-                original = self._original_params[name].to(param.device)
-                pseudo_grad = original - local_param
-                
-                # Store for all-reduce
-                self._pseudo_grads[name] = pseudo_grad
-                
-                # Store local copy for eager mixing
-                if self._use_eager:
-                    self._local_pseudo_grads[name] = pseudo_grad.clone()
-    
-    def _start_allreduce(self) -> None:
-        """Start non-blocking all-reduce on pseudo-gradients."""
-        self._allreduce_works = []
-        for name in self._pseudo_grads:
-            work = self._manager.allreduce(self._pseudo_grads[name])
-            self._allreduce_works.append(work)
-    
-    def _wait_for_allreduce(self) -> None:
-        """Wait for all-reduce operations to complete."""
-        for work in self._allreduce_works:
-            work.wait()
-        self._allreduce_works = []
-    
-    def _apply_standard_update(self) -> None:
-        """
-        Apply standard DiLoCo update using all-reduced pseudo-gradients.
-        """
-        with torch.no_grad():
-            # Restore to checkpoint
-            self._restore_original_params()
-            
-            # Set pseudo-gradients as gradients for outer optimizer
-            for name, param in self._model.named_parameters():
-                grad = self._pseudo_grads[name]
-                if isinstance(param, DTensor):
-                    param.grad = DTensor.from_local(
-                        grad,
-                        param.device_mesh,
-                        param.placements,
-                        shape=param.shape,
-                        stride=param.stride(),
-                    )
-                else:
-                    param.grad = grad
-            
-            # Apply outer optimizer
-            self._outer_optimizer.step()
-            self._outer_optimizer.zero_grad()
-            
-            # Save new checkpoint
-            self._save_original_params()
-    
-    def _apply_eager_update(self) -> None:
-        """
-        Apply eager update mixing current local with previous all-reduced.
         
-        Formula: Δ̃ = (1/M) * Δ_current_local + ((M-1)/M) * Δ_previous_allreduced
-        """
-        with torch.no_grad():
-            # Restore to checkpoint
-            self._restore_original_params()
-            
-            world_size = self._manager.world_size()
-            
-            # Compute and apply eager gradients
-            for name, param in self._model.named_parameters():
-                # Get previous all-reduced gradient
-                prev_allreduced = self._pseudo_grads[name]
-                
-                # Get current local gradient
-                curr_local = self._local_pseudo_grads[name]
-                
-                # Mix: weighted average favoring the all-reduced gradient
-                eager_grad = (
-                    (1.0 / world_size) * curr_local + 
-                    ((world_size - 1.0) / world_size) * prev_allreduced
-                )
-                
-                # Apply scaling if needed
-                eager_grad = eager_grad * self._outer_lr_scale
-                
-                # Set as gradient for outer optimizer
-                if isinstance(param, DTensor):
-                    param.grad = DTensor.from_local(
-                        eager_grad,
-                        param.device_mesh,
-                        param.placements,
-                        shape=param.shape,
-                        stride=param.stride(),
-                    )
-                else:
-                    param.grad = eager_grad
-            
-            # Apply outer optimizer
-            self._outer_optimizer.step()
-            self._outer_optimizer.zero_grad()
-            
-            # Save new checkpoint
-            self._save_original_params()
-    
-    def _sync(self) -> None:
-        """
-        Main synchronization logic implementing the eager algorithm.
-        """
-        # Start new quorum
-        self._manager.start_quorum()
         
-        # Compute current pseudo-gradients
-        self._compute_pseudo_gradients()
-        
-        if self._use_eager and self._has_pending_allreduce:
-            # Eager mode with pending all-reduce
-            # 1. Wait for previous all-reduce
-            self._wait_for_allreduce()
-            
-            # 2. Apply eager update (mix current local with previous all-reduced)
-            self._apply_eager_update()
-            
-            # 3. Start new all-reduce with current pseudo-gradients
-            self._start_allreduce()
-            
-        elif not self._use_eager and self._has_pending_allreduce:
-            # Standard delayed mode
-            # 1. Wait for previous all-reduce
-            self._wait_for_allreduce()
-            
-            # 2. Apply standard update with previous gradients
-            self._apply_standard_update()
-            
-            # 3. Start new all-reduce with current pseudo-gradients
-            self._compute_pseudo_gradients()  # Recompute after update
-            self._start_allreduce()
-            
-        else:
-            # First sync (no pending all-reduce)
-            # Just start all-reduce
-            self._start_allreduce()
-            self._has_pending_allreduce = True
-            
-            # For non-eager mode or first step, we need to wait and apply
-            if not self._use_eager:
-                self._wait_for_allreduce()
-                if self._manager.should_commit():
-                    self._apply_standard_update()
-                self._has_pending_allreduce = False
-            
-            return
-        
-        # Mark that we have a pending all-reduce
-        self._has_pending_allreduce = True
-    
-    def _step_post_hook(
-        self, optim: optim.Optimizer, args: Tuple[Any, ...], kwargs: Dict[str, Any]
-    ) -> None:
-        """Hook called after each optimizer step."""
-        self._local_step += 1
-        if self._local_step >= self._sync_every:
-            self._sync()
-            self._local_step = 0
-    
-    def __enter__(self) -> "EagerDiLoCo":
-        """Context manager entry."""
-        # Register optimizer hook
+    def __enter__(self) -> "LocalSGD":
+        self._hooks.append(
+            self._inner_optimizer.register_step_pre_hook(self._step_pre_hook)
+        )
+        # Add optimizer hook which increments the local step counter and syncs if necessary
         self._hooks.append(
             self._inner_optimizer.register_step_post_hook(self._step_post_hook)
         )
         return self
-    
+
     def __exit__(
         self,
         exc_type: Optional[Type[BaseException]],
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> bool:
-        """Context manager exit."""
+        # Handle any cleanup or error handling here
         # Clean up hooks
         for hook in self._hooks:
             hook.remove()
         self._hooks.clear()
-        
-        # If we have a pending all-reduce, wait for it
-        if self._has_pending_allreduce:
-            self._wait_for_allreduce()
-            if not self._use_eager and self._manager.should_commit():
-                self._apply_standard_update()
-        
+
         return False  # Propagate exceptions
+
+    def _step_pre_hook(
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
+    ) -> None:
+        # The checkpoint may transfer model parameters, so we need to make access to it thread safe
+        self._manager.disallow_state_dict_read()
+
+    def _step_post_hook(
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
+    ) -> None:
+        """
+        This hook is registered on the optimizer and is called after the optimizer step.
+        """
+        self._manager.allow_state_dict_read()
+
+        self._local_step += 1
+        if self._local_step >= self._sync_every:
+            self.sync()
+
+    def sync(self) -> None:
+        """
+        Synchronizes and averages the model weights across the manager.
+        """
+        self._manager.start_quorum()
+        self._perform_sync()
+        self._local_step = 0
+
+    @torch.no_grad()
+    def _perform_sync(self) -> None:
+        """
+        Performs the synchronization of the model weights across the manager.
+        """
+        
+        
+        if self._manager.should_commit():
+            pseudo_grads = dict()
+                        
+            for name, param in self._model.named_parameters():
+                og_param = self._original_params[name]
+                pseudo_grads[name] = og_param - extract_local_tensor_no_clone(param)
+            
+            
+            work_handles = []
+            avg_pseudo_grads = dict()
+            
+            for name, pseudo_grad in pseudo_grads.items():
+                avg_pseudo_grad = extract_local_tensor_no_clone(pseudo_grad)
+                work_handles.append(self._manager.allreduce(avg_pseudo_grad))
+                avg_pseudo_grads[name] = avg_pseudo_grad
+
+            if self.prev_work_handles is not None:
+                for work_handle in self.prev_work_handles:
+                    work_handle.wait()
+            
+                for name, param in self._model.named_parameters():
+                    
+                    local_data = extract_local_tensor_no_clone(param.data)
+                    local_data.copy_(self._original_params[name])
+                    
+                    param.grad = torch.zeros_like(param.data)
+                    
+                    local_grad = extract_local_tensor_no_clone(param.grad)
+                    local_grad.copy_(self.prev_pseudo_grads[name])
+            
+                self._outer_optimizer.step()
+                self._outer_optimizer.zero_grad()
+            
+                self._save_original_params()
+            else:
+                for name, param in self._model.named_parameters():
+                    
+                    local_data = extract_local_tensor_no_clone(param.data)
+                    local_data.copy_(self._original_params[name])
+                    param.grad = None
+                    
+
+            self.prev_pseudo_grads = avg_pseudo_grads
+            self.prev_work_handles = work_handles
